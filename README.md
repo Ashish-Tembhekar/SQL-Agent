@@ -1,6 +1,6 @@
 # SQL Querying AI Agent
 
-A CLI-based AI Agent built with Langchain that translates natural language questions into SQL queries, executes them against a Supabase PostgreSQL database, and returns answers in plain English.
+A CLI-based AI Agent built with Langchain that translates natural language questions into SQL queries, executes them against a Supabase PostgreSQL database, and returns answers in plain English. The agent is database-agnostic — it dynamically fetches the schema of whatever Supabase PostgreSQL database you connect it to.
 
 ## Features
 
@@ -9,16 +9,17 @@ A CLI-based AI Agent built with Langchain that translates natural language quest
 - **Verbose Debugging Mode**: Inspect every step of the agent's reasoning process
 - **Supabase Integration**: Connected to a PostgreSQL database via Supabase REST API
 - **Safe Execution**: Only SELECT queries are allowed; no data modification permitted
-- **Schema-Aware**: Agent loads database schema at startup for accurate query generation
+- **Dynamic Schema Discovery**: Automatically fetches database schema at startup — works with any PostgreSQL database, not hardcoded to a specific schema
+- **Database-Agnostic**: Point it at any Supabase project and it adapts to whatever tables exist
 
 ## Project Structure
 
 ```
-D:\SQL Agent\
+SQL Agent/
 ├── agent.py           # Main CLI application
 ├── requirements.txt   # Python dependencies
 ├── .env               # Environment variables (do not commit)
-├── MOCK_DATA.csv      # Source data (500 employee records)
+├── .gitignore         # Git ignore rules
 └── README.md          # This file
 ```
 
@@ -32,10 +33,10 @@ D:\SQL Agent\
 
 ## Installation
 
-1. **Clone or navigate to the project directory:**
+1. **Navigate to the project directory:**
 
    ```bash
-   cd "D:\SQL Agent"
+   cd "path/to/SQL Agent"
    ```
 
 2. **Install dependencies:**
@@ -46,7 +47,7 @@ D:\SQL Agent\
 
 3. **Configure environment variables:**
 
-   Edit the `.env` file with your credentials:
+   Create a `.env` file with your credentials:
 
    ```env
    # Supabase Configuration
@@ -64,26 +65,43 @@ D:\SQL Agent\
 
 ## Database Setup
 
-The project includes a Supabase MCP integration to set up the database automatically. The following has been configured:
+The agent works with **any** Supabase PostgreSQL database. It dynamically discovers the schema at startup by querying the `information_schema.columns` table.
 
-### Table: `employees`
+### Required SQL Function
 
-| Column     | Type     | Description              |
-|------------|----------|--------------------------|
-| id         | INTEGER  | Primary key              |
-| first_name | VARCHAR  | Employee first name      |
-| last_name  | VARCHAR  | Employee last name       |
-| email      | VARCHAR  | Employee email address   |
-| gender     | VARCHAR  | Gender identity          |
-| role       | VARCHAR  | Department/role          |
+You need to create one helper function in your Supabase database to enable raw SQL execution via RPC:
 
-### Sample Data
+```sql
+CREATE OR REPLACE FUNCTION exec_sql(sql text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  result jsonb;
+BEGIN
+  EXECUTE format('SELECT jsonb_agg(t) FROM (%s) t', sql) INTO result;
+  RETURN result;
+END;
+$$;
+```
 
-500 employee records loaded from `MOCK_DATA.csv` with diverse roles and gender identities.
+This function:
+- Accepts a SQL query as text
+- Executes it safely within the database
+- Returns results as JSONB
+- Uses `SECURITY DEFINER` to run with elevated privileges (required for `information_schema` access)
 
-### SQL Function
+### How Schema Discovery Works
 
-A helper function `exec_sql(sql text)` is created in Supabase to execute raw SQL queries via RPC calls.
+On startup, the agent:
+1. Connects to your Supabase database
+2. Queries `information_schema.columns` to get all tables, columns, data types, nullability, and defaults
+3. Queries row counts for each table
+4. Formats this into a readable schema summary
+5. Injects it into the agent's system prompt
+
+This means the agent **automatically adapts** to whatever database you point it at — no hardcoded table names or column definitions.
 
 ## Usage
 
@@ -93,7 +111,7 @@ A helper function `exec_sql(sql text)` is created in Supabase to execute raw SQL
 python agent.py
 ```
 
-The agent will start and display only the final answer to each question.
+The agent will start, fetch the schema, and display only the final answer to each question.
 
 ### Verbose Mode (Show All Steps)
 
@@ -140,20 +158,20 @@ python agent.py -o -v
 
 ## Example Queries
 
-Once the agent is running, try asking:
+Once the agent is running, try asking questions relevant to your database:
 
 ```
-You: How many employees are in the Engineering department?
-Agent: There are 39 employees in the Engineering department.
+You: How many records are in the users table?
+Agent: There are 1,247 records in the users table.
 
-You: Show me the gender distribution across all roles
-Agent: [Detailed breakdown of gender by role...]
+You: Show me the top 5 products by revenue
+Agent: [List of top 5 products with revenue figures...]
 
-You: List all employees in Marketing with their email addresses
-Agent: [List of Marketing employees with emails...]
+You: What is the average order value by customer segment?
+Agent: [Breakdown of average order values...]
 
-You: What is the most common role in the company?
-Agent: [Analysis of role frequencies...]
+You: List all orders from the last 30 days
+Agent: [List of recent orders...]
 
 You: /bye
 Agent: Goodbye!
@@ -187,11 +205,30 @@ User Input
 
 ### Agent Flow
 
-1. **User inputs** a natural language question
-2. **LLM analyzes** the question and decides which tool to use
-3. **Tool execution**: SQL query is generated and executed against Supabase
-4. **Results returned** to the LLM for analysis
-5. **Final answer** generated in natural language and displayed to the user
+1. **Startup**: Agent connects to Supabase and fetches the full database schema from `information_schema`
+2. **User inputs** a natural language question
+3. **LLM analyzes** the question with schema context and decides which tool to use
+4. **Tool execution**: SQL query is generated and executed against Supabase via RPC
+5. **Results returned** to the LLM for analysis
+6. **Final answer** generated in natural language and displayed to the user
+
+### Schema Discovery Query
+
+The agent runs this query at startup to discover your database structure:
+
+```sql
+SELECT 
+    table_name,
+    column_name,
+    data_type,
+    is_nullable,
+    column_default
+FROM information_schema.columns
+WHERE table_schema = 'public'
+ORDER BY table_name, ordinal_position;
+```
+
+This returns every table, column, data type, nullability constraint, and default value — giving the LLM complete context to write accurate SQL queries.
 
 ## Environment Variables
 
@@ -206,9 +243,10 @@ User Input
 
 ## Security Notes
 
-- **Read-Only Access**: The agent only executes SELECT queries; INSERT, UPDATE, DELETE, and DROP are blocked
+- **Read-Only Access**: The agent only executes SELECT queries; INSERT, UPDATE, DELETE, and DROP are blocked at the tool level
 - **API Key Safety**: Never commit the `.env` file to version control
 - **Supabase Key**: Use the anon key for read-only operations; service role key provides full access
+- **RPC Function**: The `exec_sql` function uses `SECURITY DEFINER` — ensure your Supabase RLS policies are configured appropriately
 
 ## Troubleshooting
 
@@ -223,6 +261,12 @@ Verify your `SUPABASE_URL` and `SUPABASE_KEY` are correct in the `.env` file.
 
 ### LLM API errors
 Check that your `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` are correctly configured.
+
+### "No tables found" error
+Ensure your database has tables in the `public` schema. The agent only discovers tables in the public schema by default.
+
+### RPC function not found
+Make sure you've created the `exec_sql` function in your Supabase database (see Database Setup section).
 
 ## Dependencies
 

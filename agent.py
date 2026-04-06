@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import argparse
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -79,6 +80,252 @@ class AgentCallbackHandler(BaseCallbackHandler):
     def on_tool_error(self, error, **kwargs):
         print(f"\nTool Error: {error}")
 
+class SchemaCache:
+    def __init__(self, ttl=60):
+        self.ttl = ttl
+        self.cache = {}
+        self.timestamps = {}
+
+    def get(self, key):
+        if key in self.cache and (time.time() - self.timestamps[key]) < self.ttl:
+            return self.cache[key]
+        return None
+
+    def set(self, key, value):
+        self.cache[key] = value
+        self.timestamps[key] = time.time()
+
+    def invalidate(self, key=None):
+        if key:
+            self.cache.pop(key, None)
+            self.timestamps.pop(key, None)
+        else:
+            self.cache.clear()
+            self.timestamps.clear()
+
+schema_cache = SchemaCache(ttl=60)
+
+def _run_sql(sql: str):
+    response = supabase.rpc("exec_sql", {"sql": sql}).execute()
+    return response.data
+
+def _fetch_all_schema():
+    try:
+        columns_query = """
+        SELECT
+            c.table_name,
+            c.column_name,
+            c.data_type,
+            c.is_nullable,
+            c.column_default,
+            c.ordinal_position
+        FROM information_schema.columns c
+        WHERE c.table_schema = 'public'
+          AND c.table_name IN (SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE')
+        ORDER BY c.table_name, c.ordinal_position
+        """
+        columns = _run_sql(columns_query)
+        if not columns or columns == [None]:
+            return "No tables found in the public schema."
+
+        pk_query = """
+        SELECT
+            tc.table_name,
+            kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = 'public'
+        ORDER BY tc.table_name
+        """
+        pks = {}
+        try:
+            pk_rows = _run_sql(pk_query)
+            if pk_rows and pk_rows != [None]:
+                for row in pk_rows:
+                    t = row.get("table_name")
+                    c = row.get("column_name")
+                    pks.setdefault(t, []).append(c)
+        except:
+            pass
+
+        fk_query = """
+        SELECT
+            tc.table_name,
+            kcu.column_name,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+            ON tc.constraint_name = ccu.constraint_name
+            AND tc.table_schema = ccu.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public'
+        """
+        fks = {}
+        try:
+            fk_rows = _run_sql(fk_query)
+            if fk_rows and fk_rows != [None]:
+                for row in fk_rows:
+                    t = row.get("table_name")
+                    fks.setdefault(t, []).append(row)
+        except:
+            pass
+
+        count_query = """
+        SELECT relname as table_name, n_live_tup as row_count
+        FROM pg_stat_user_tables
+        WHERE schemaname = 'public'
+        ORDER BY relname
+        """
+        row_counts = {}
+        try:
+            count_rows = _run_sql(count_query)
+            if count_rows and count_rows != [None]:
+                for row in count_rows:
+                    if row:
+                        row_counts[row.get("table_name")] = row.get("row_count", "unknown")
+        except:
+            pass
+
+        schema_text = ""
+        current_table = None
+
+        for col in columns:
+            if col is None:
+                continue
+            table_name = col.get("table_name")
+            column_name = col.get("column_name")
+            data_type = col.get("data_type")
+            is_nullable = col.get("is_nullable", "YES")
+            column_default = col.get("column_default")
+
+            if table_name != current_table:
+                if current_table is not None:
+                    schema_text += "\n"
+                schema_text += f"Table: {table_name}"
+                if table_name in row_counts:
+                    schema_text += f" ({row_counts[table_name]} rows)"
+                schema_text += "\nColumns:\n"
+                current_table = table_name
+
+            nullable_str = "NULLABLE" if is_nullable == "YES" else "NOT NULL"
+            default_str = f" DEFAULT {column_default}" if column_default else ""
+            pk_marker = " [PRIMARY KEY]" if table_name in pks and column_name in pks[table_name] else ""
+            schema_text += f"  - {column_name} ({data_type.upper()}, {nullable_str}{default_str}{pk_marker})\n"
+
+        if fks:
+            schema_text += "\nForeign Keys:\n"
+            for table, fk_list in fks.items():
+                for fk in fk_list:
+                    schema_text += f"  - {table}.{fk['column_name']} -> {fk['foreign_table_name']}.{fk['foreign_column_name']}\n"
+
+        return schema_text
+
+    except Exception as e:
+        return f"Error fetching schema: {str(e)}"
+
+def _fetch_table_schema(table_name: str):
+    try:
+        columns_query = f"""
+        SELECT
+            c.column_name,
+            c.data_type,
+            c.is_nullable,
+            c.column_default
+        FROM information_schema.columns c
+        WHERE c.table_schema = 'public'
+          AND c.table_name = '{table_name}'
+        ORDER BY c.ordinal_position
+        """
+        columns = _run_sql(columns_query)
+        if not columns or columns == [None]:
+            return f"Error: Table '{table_name}' not found in the public schema."
+
+        pk_query = f"""
+        SELECT kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = 'public'
+          AND tc.table_name = '{table_name}'
+        """
+        pk_cols = []
+        try:
+            pk_rows = _run_sql(pk_query)
+            if pk_rows and pk_rows != [None]:
+                pk_cols = [r.get("column_name") for r in pk_rows if r]
+        except:
+            pass
+
+        fk_query = f"""
+        SELECT
+            kcu.column_name,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+            ON tc.constraint_name = ccu.constraint_name
+            AND tc.table_schema = ccu.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public'
+          AND tc.table_name = '{table_name}'
+        """
+        fk_rows = []
+        try:
+            fk_rows = _run_sql(fk_query) or []
+            if fk_rows == [None]:
+                fk_rows = []
+        except:
+            pass
+
+        count_query = f"""
+        SELECT n_live_tup as row_count
+        FROM pg_stat_user_tables
+        WHERE schemaname = 'public' AND relname = '{table_name}'
+        """
+        row_count = "unknown"
+        try:
+            count_rows = _run_sql(count_query)
+            if count_rows and count_rows != [None] and count_rows[0]:
+                row_count = count_rows[0].get("row_count", "unknown")
+        except:
+            pass
+
+        schema_text = f"Table: {table_name} ({row_count} rows)\nColumns:\n"
+        for col in columns:
+            if col is None:
+                continue
+            column_name = col.get("column_name")
+            data_type = col.get("data_type")
+            is_nullable = col.get("is_nullable", "YES")
+            column_default = col.get("column_default")
+            nullable_str = "NULLABLE" if is_nullable == "YES" else "NOT NULL"
+            default_str = f" DEFAULT {column_default}" if column_default else ""
+            pk_marker = " [PRIMARY KEY]" if column_name in pk_cols else ""
+            schema_text += f"  - {column_name} ({data_type.upper()}, {nullable_str}{default_str}{pk_marker})\n"
+
+        if fk_rows:
+            schema_text += "\nForeign Keys:\n"
+            for fk in fk_rows:
+                if fk:
+                    schema_text += f"  - {table_name}.{fk['column_name']} -> {fk['foreign_table_name']}.{fk['foreign_column_name']}\n"
+
+        return schema_text
+
+    except Exception as e:
+        return f"Error fetching schema for '{table_name}': {str(e)}"
+
 parser = argparse.ArgumentParser(description="SQL Querying AI Agent")
 parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed agent thinking steps and tool calls")
 parser.add_argument("-o", "--ollama", action="store_true", help="Use local Ollama instead of OpenAI-compatible endpoints")
@@ -87,21 +334,7 @@ args = parser.parse_args()
 print("Connecting to Supabase...")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 print("Connected successfully!")
-
-schema_info = """
-Table: employees
-Columns:
-- id (INTEGER, PRIMARY KEY)
-- first_name (VARCHAR)
-- last_name (VARCHAR)
-- email (VARCHAR)
-- gender (VARCHAR)
-- role (VARCHAR)
-
-Total records: 500 employees
-Roles include: Engineering, Marketing, Sales, Legal, Accounting, Human Resources, Business Development, Product Management, Services, Support, Training, Research and Development
-Genders include: Male, Female, Agender, Genderfluid, Genderqueer, Bigender, Polygender, Non-binary
-"""
+print()
 
 if args.ollama:
     if not OLLAMA_MODEL_ID or "YOUR_" in OLLAMA_MODEL_ID:
@@ -129,41 +362,62 @@ else:
         temperature=0,
     )
 
+retry_state = {"count": 0}
+
 @tool
 def execute_sql_query(query: str) -> str:
     """Execute a SQL SELECT query against the Supabase PostgreSQL database and return results."""
     if not query.upper().strip().startswith("SELECT"):
         return "Error: Only SELECT queries are allowed"
     
+    retry_state["count"] += 1
+    
     try:
         response = supabase.rpc("exec_sql", {"sql": query}).execute()
+        if response.data is None or response.data == [None]:
+            return "Query executed successfully. No rows returned."
+        retry_state["count"] = 0
         return str(response.data)
     except Exception as e:
-        return f"Error executing query: {str(e)}"
+        error_msg = str(e)
+        if retry_state["count"] >= 3:
+            return f"Error: Maximum retry attempts (3) reached. Review the schema with get_table_schema() and try a different approach. Last error: {error_msg}"
+        return f"SQL Error: {error_msg}"
 
 @tool
-def get_table_schema() -> str:
-    """Get the schema information for all tables in the database."""
-    return schema_info
+def get_table_schema(table_name: str = "") -> str:
+    """Get the schema information for tables in the database. Optionally provide a table_name to get schema for a specific table."""
+    if table_name:
+        cached = schema_cache.get(table_name)
+        if cached:
+            return cached
+        result = _fetch_table_schema(table_name)
+        schema_cache.set(table_name, result)
+        return result
+    else:
+        cached = schema_cache.get("__all__")
+        if cached:
+            return cached
+        result = _fetch_all_schema()
+        schema_cache.set("__all__", result)
+        return result
 
 tools = [execute_sql_query, get_table_schema]
 
-system_prompt = f"""You are a SQL Querying AI Agent connected to a Supabase PostgreSQL database.
-
-DATABASE SCHEMA:
-{schema_info}
+system_prompt = """You are a SQL Querying AI Agent connected to a Supabase PostgreSQL database.
 
 Your task is to:
-1. Understand the user's question
-2. Generate the appropriate SQL query to fetch the data
-3. Execute the query using the execute_sql_query tool
-4. Analyze the results
-5. Provide a clear, natural language answer based on the fetched data
+1. Call get_table_schema() to discover available tables, columns, types, primary keys, and foreign keys
+2. Generate the appropriate SQL query based on the schema
+3. Execute it using execute_sql_query()
+4. Analyze the results and provide a clear natural language answer
 
 Rules:
 - Only use SELECT queries (no INSERT, UPDATE, DELETE, DROP, etc.)
-- Always check the schema before writing queries
-- If a query fails, try to fix it and retry
+- ALWAYS call get_table_schema() before writing queries to ensure you have the latest schema
+- If execute_sql_query() returns an error starting with "SQL Error:", analyze the error message carefully, fix the SQL, and retry
+- You have a maximum of 3 retry attempts per query — use them wisely
+- Common error fixes: table/column name typos, wrong data type comparisons, missing JOIN conditions, incorrect column references
 - Present results in a clear, readable format
 - If the question cannot be answered with the available data, explain why"""
 
@@ -192,6 +446,8 @@ while True:
         if user_input.lower() == "/bye":
             print("Agent: Goodbye!")
             break
+        
+        retry_state["count"] = 0
         
         config = {"callbacks": [callback_handler]} if callback_handler else {}
         result = agent_executor.invoke({"messages": [("human", user_input)]}, config=config)
