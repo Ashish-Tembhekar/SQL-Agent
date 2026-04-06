@@ -1,4 +1,4 @@
-# SQL Querying AI Agent
+# SQL AI Agent
 
 A CLI-based and web-enabled AI Agent built with Langchain that translates natural language questions into SQL queries, executes them against a Supabase PostgreSQL database, and returns answers in plain English. The agent is database-agnostic — it dynamically fetches the schema of whatever Supabase PostgreSQL database you connect it to.
 
@@ -34,8 +34,8 @@ SQL-Agent/
 │   │   ├── main.jsx             # React entry point
 │   │   ├── components/
 │   │   │   ├── ChatWindow.jsx   # Chat message display
-│   │   │   ├── MessageBubble.jsx # Individual message component
 │   │   │   ├── InputBar.jsx     # User input with send button
+│   │   │   ├── MessageBubble.jsx # Individual message component
 │   │   │   └── PendingChanges.jsx # Preview pending write operations
 │   │   ├── hooks/
 │   │   │   └── useChat.js       # WebSocket/chat state management
@@ -44,8 +44,7 @@ SQL-Agent/
 │   ├── package.json
 │   ├── vite.config.js
 │   └── index.html
-├── cli.py                       # Refactored CLI (imports from backend)
-├── agent.py                     # Original CLI (kept for reference)
+├── cli.py                       # CLI entry point (imports from backend)
 ├── requirements.txt             # Root-level Python dependencies
 ├── Changes.md                   # Database change log
 └── README.md                    # This file
