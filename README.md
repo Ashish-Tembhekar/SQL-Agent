@@ -1,6 +1,6 @@
 # SQL Querying AI Agent
 
-A CLI-based AI Agent built with Langchain that translates natural language questions into SQL queries, executes them against a Supabase PostgreSQL database, and returns answers in plain English. The agent is database-agnostic — it dynamically fetches the schema of whatever Supabase PostgreSQL database you connect it to.
+A CLI-based and web-enabled AI Agent built with Langchain that translates natural language questions into SQL queries, executes them against a Supabase PostgreSQL database, and returns answers in plain English. The agent is database-agnostic — it dynamically fetches the schema of whatever Supabase PostgreSQL database you connect it to.
 
 ## Features
 
@@ -8,24 +8,53 @@ A CLI-based AI Agent built with Langchain that translates natural language quest
 - **Dual LLM Support**: Use OpenAI-compatible endpoints (NVIDIA, OpenRouter, etc.) or local Ollama
 - **Verbose Debugging Mode**: Inspect every step of the agent's reasoning process
 - **Supabase Integration**: Connected to a PostgreSQL database via Supabase REST API
-- **Safe Execution**: Only SELECT queries are allowed; no data modification permitted
-- **Dynamic Schema Discovery**: Automatically fetches database schema at startup — works with any PostgreSQL database, not hardcoded to a specific schema
+- **Safe Write Operations**: INSERT/UPDATE/DELETE are queued as pending changes with preview before commit
+- **Dynamic Schema Discovery**: Automatically fetches database schema — works with any PostgreSQL database
 - **Database-Agnostic**: Point it at any Supabase project and it adapts to whatever tables exist
+- **Three Interfaces**: CLI, REST API, and WebSocket-powered React chat UI
 
 ## Project Structure
 
 ```
-SQL Agent/
-├── agent.py           # Main CLI application
-├── requirements.txt   # Python dependencies
-├── .env               # Environment variables (do not commit)
-├── .gitignore         # Git ignore rules
-└── README.md          # This file
+SQL-Agent/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py              # FastAPI app entry point
+│   │   ├── agent.py             # Core agent logic
+│   │   ├── tools.py             # Agent tools (execute_sql, get_schema, commit, rollback)
+│   │   ├── models.py            # Pydantic models for API
+│   │   ├── schemas.py           # Schema cache, transaction state, helpers
+│   │   ├── config.py            # Environment config
+│   │   └── callbacks.py         # Streaming callback handler
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── App.jsx              # Main app component
+│   │   ├── main.jsx             # React entry point
+│   │   ├── components/
+│   │   │   ├── ChatWindow.jsx   # Chat message display
+│   │   │   ├── MessageBubble.jsx # Individual message component
+│   │   │   ├── InputBar.jsx     # User input with send button
+│   │   │   └── PendingChanges.jsx # Preview pending write operations
+│   │   ├── hooks/
+│   │   │   └── useChat.js       # WebSocket/chat state management
+│   │   └── styles/
+│   │       └── App.css          # Chat UI styling
+│   ├── package.json
+│   ├── vite.config.js
+│   └── index.html
+├── cli.py                       # Refactored CLI (imports from backend)
+├── agent.py                     # Original CLI (kept for reference)
+├── requirements.txt             # Root-level Python dependencies
+├── Changes.md                   # Database change log
+└── README.md                    # This file
 ```
 
 ## Prerequisites
 
 - Python 3.10 or higher
+- Node.js 18 or higher (for the web UI)
 - A Supabase project with PostgreSQL database
 - Either:
   - An OpenAI-compatible API endpoint (NVIDIA NIM, OpenRouter, etc.)
@@ -36,16 +65,24 @@ SQL Agent/
 1. **Navigate to the project directory:**
 
    ```bash
-   cd "path/to/SQL Agent"
+   cd "path/to/SQL-Agent"
    ```
 
-2. **Install dependencies:**
+2. **Install Python dependencies:**
 
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Configure environment variables:**
+3. **Install frontend dependencies:**
+
+   ```bash
+   cd frontend
+   npm install
+   cd ..
+   ```
+
+4. **Configure environment variables:**
 
    Create a `.env` file with your credentials:
 
@@ -67,11 +104,12 @@ SQL Agent/
 
 The agent works with **any** Supabase PostgreSQL database. It dynamically discovers the schema at startup by querying the `information_schema.columns` table.
 
-### Required SQL Function
+### Required SQL Functions
 
-You need to create one helper function in your Supabase database to enable raw SQL execution via RPC:
+You need to create two helper functions in your Supabase database:
 
 ```sql
+-- For read queries
 CREATE OR REPLACE FUNCTION exec_sql(sql text)
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -84,71 +122,49 @@ BEGIN
   RETURN result;
 END;
 $$;
+
+-- For write queries (INSERT/UPDATE/DELETE)
+CREATE OR REPLACE FUNCTION exec_sql_write(sql text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  result jsonb;
+BEGIN
+  EXECUTE sql;
+  GET DIAGNOSTICS result = ROW_COUNT;
+  RETURN jsonb_build_object('rows_affected', result);
+END;
+$$;
 ```
-
-This function:
-- Accepts a SQL query as text
-- Executes it safely within the database
-- Returns results as JSONB
-- Uses `SECURITY DEFINER` to run with elevated privileges (required for `information_schema` access)
-
-### How Schema Discovery Works
-
-On startup, the agent:
-1. Connects to your Supabase database
-2. Queries `information_schema.columns` to get all tables, columns, data types, nullability, and defaults
-3. Queries row counts for each table
-4. Formats this into a readable schema summary
-5. Injects it into the agent's system prompt
-
-This means the agent **automatically adapts** to whatever database you point it at — no hardcoded table names or column definitions.
 
 ## Usage
 
-### Basic Mode (Clean Output)
+### Option 1: Web UI (Recommended)
+
+Start the backend server:
 
 ```bash
-python agent.py
+python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The agent will start, fetch the schema, and display only the final answer to each question.
-
-### Verbose Mode (Show All Steps)
+In a separate terminal, start the frontend dev server:
 
 ```bash
-python agent.py -v
+cd frontend
+npm run dev
 ```
 
-Displays the complete reasoning chain including:
-- LLM call start and prompts
-- LLM responses with tool calls
-- Tool inputs and outputs
-- Final answer
+Open `http://localhost:3000` in your browser.
 
-### Ollama Mode (Local Inference)
+### Option 2: CLI
 
 ```bash
-python agent.py -o
+python cli.py
 ```
 
-Uses your local Ollama instance instead of cloud APIs. Requires Ollama to be running on `localhost:11434`.
-
-### Ollama + Verbose
-
-```bash
-python agent.py -o -v
-```
-
-### Combined Flags
-
-| Command              | Description                           |
-|----------------------|---------------------------------------|
-| `python agent.py`    | Cloud API, clean output               |
-| `python agent.py -v` | Cloud API, verbose output             |
-| `python agent.py -o` | Local Ollama, clean output            |
-| `python agent.py -o -v` | Local Ollama, verbose output     |
-
-## CLI Arguments
+#### CLI Flags
 
 | Flag           | Description                                      |
 |----------------|--------------------------------------------------|
@@ -156,9 +172,52 @@ python agent.py -o -v
 | `-o, --ollama` | Use local Ollama instead of OpenAI-compatible endpoints|
 | `-h, --help`   | Show help message and exit                       |
 
-## Example Queries
+#### Examples
 
-Once the agent is running, try asking questions relevant to your database:
+```bash
+python cli.py              # Cloud API, clean output
+python cli.py -v           # Cloud API, verbose output
+python cli.py -o           # Local Ollama, clean output
+python cli.py -o -v        # Local Ollama, verbose output
+```
+
+### Option 3: REST API
+
+```bash
+# Send a chat message
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "How many users are there?", "session_id": "default"}'
+
+# Commit pending changes
+curl -X POST http://localhost:8000/api/commit \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "default"}'
+
+# Rollback pending changes
+curl -X POST http://localhost:8000/api/rollback \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "default"}'
+
+# Check session status
+curl http://localhost:8000/api/session/default
+```
+
+### WebSocket API
+
+Connect to `ws://localhost:8000/ws/chat/{session_id}` and send JSON messages:
+
+```json
+{"message": "How many users are there?", "use_ollama": false}
+```
+
+Responses are streamed back as JSON:
+
+```json
+{"type": "done", "content": "...", "session_id": "default", "has_pending_changes": false}
+```
+
+## Example Queries
 
 ```
 You: How many records are in the users table?
@@ -170,8 +229,18 @@ Agent: [List of top 5 products with revenue figures...]
 You: What is the average order value by customer segment?
 Agent: [Breakdown of average order values...]
 
-You: List all orders from the last 30 days
-Agent: [List of recent orders...]
+You: Update the email for user ID 1 to new@email.com
+Agent: PENDING UPDATE on table 'users'
+       SQL: UPDATE users SET email = 'new@email.com' WHERE id = 1
+       Preview of affected rows (1 total):
+         Row 1: {"id": 1, "email": "old@email.com", ...}
+       This change is queued. Use commit_transaction() to apply all pending changes
+       or rollback_transaction() to discard them.
+
+You: commit
+Agent: Transaction committed successfully.
+       Total rows affected: 1
+       ...
 
 You: /bye
 Agent: Goodbye!
@@ -180,12 +249,12 @@ Agent: Goodbye!
 ## Architecture
 
 ```
-User Input
+User (Web UI / CLI / REST API)
     │
     ▼
 ┌─────────────────┐
-│  Langchain Agent │
-│  (ReAct Pattern) │
+│  FastAPI Server │
+│  (Backend)      │
 └────────┬────────┘
          │
     ┌────┴────┐
@@ -194,7 +263,8 @@ User Input
 │  LLM    │ │  Tools            │
 │ (OpenAI │ │  - execute_sql    │
 │ /Ollama)│ │  - get_schema     │
-└─────────┘ └────────┬─────────┘
+└─────────┘ │  - commit/rollback│
+            └────────┬─────────┘
                      │
                      ▼
               ┌──────────────┐
@@ -206,29 +276,19 @@ User Input
 ### Agent Flow
 
 1. **Startup**: Agent connects to Supabase and fetches the full database schema from `information_schema`
-2. **User inputs** a natural language question
+2. **User inputs** a natural language question (via CLI, REST, or WebSocket)
 3. **LLM analyzes** the question with schema context and decides which tool to use
 4. **Tool execution**: SQL query is generated and executed against Supabase via RPC
 5. **Results returned** to the LLM for analysis
 6. **Final answer** generated in natural language and displayed to the user
 
-### Schema Discovery Query
+### Write Safety
 
-The agent runs this query at startup to discover your database structure:
-
-```sql
-SELECT 
-    table_name,
-    column_name,
-    data_type,
-    is_nullable,
-    column_default
-FROM information_schema.columns
-WHERE table_schema = 'public'
-ORDER BY table_name, ordinal_position;
-```
-
-This returns every table, column, data type, nullability constraint, and default value — giving the LLM complete context to write accurate SQL queries.
+- SELECT queries execute immediately and return results
+- INSERT/UPDATE/DELETE queries are queued as pending changes with a preview of affected rows
+- Changes are only executed after explicit user confirmation (commit)
+- Pending changes can be discarded at any time (rollback)
+- All changes are logged to `Changes.md`
 
 ## Environment Variables
 
@@ -243,15 +303,18 @@ This returns every table, column, data type, nullability constraint, and default
 
 ## Security Notes
 
-- **Read-Only Access**: The agent only executes SELECT queries; INSERT, UPDATE, DELETE, and DROP are blocked at the tool level
+- **Read-Only by Default**: SELECT queries execute immediately; writes require explicit confirmation
 - **API Key Safety**: Never commit the `.env` file to version control
 - **Supabase Key**: Use the anon key for read-only operations; service role key provides full access
-- **RPC Function**: The `exec_sql` function uses `SECURITY DEFINER` — ensure your Supabase RLS policies are configured appropriately
+- **RPC Functions**: The `exec_sql` and `exec_sql_write` functions use `SECURITY DEFINER` — ensure your Supabase RLS policies are configured appropriately
 
 ## Troubleshooting
 
 ### "Module not found" errors
 Run `pip install -r requirements.txt` to install all dependencies.
+
+### "Cannot find module" in frontend
+Run `cd frontend && npm install` to install frontend dependencies.
 
 ### Ollama connection refused
 Ensure Ollama is running: `ollama serve` or check if it's running on `localhost:11434`.
@@ -266,9 +329,11 @@ Check that your `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL` are corr
 Ensure your database has tables in the `public` schema. The agent only discovers tables in the public schema by default.
 
 ### RPC function not found
-Make sure you've created the `exec_sql` function in your Supabase database (see Database Setup section).
+Make sure you've created both `exec_sql` and `exec_sql_write` functions in your Supabase database (see Database Setup section).
 
 ## Dependencies
+
+### Backend
 
 | Package              | Purpose                          |
 |----------------------|----------------------------------|
@@ -278,6 +343,17 @@ Make sure you've created the `exec_sql` function in your Supabase database (see 
 | python-dotenv        | Environment variable management  |
 | supabase             | Supabase Python client           |
 | psycopg2-binary      | PostgreSQL driver                |
+| fastapi              | Web framework                    |
+| uvicorn              | ASGI server                      |
+| websockets           | WebSocket support                |
+
+### Frontend
+
+| Package              | Purpose                          |
+|----------------------|----------------------------------|
+| react                | UI library                       |
+| react-dom            | React DOM rendering              |
+| vite                 | Build tool and dev server        |
 
 ## License
 
